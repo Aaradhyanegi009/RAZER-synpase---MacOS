@@ -626,11 +626,29 @@ struct ContentView: View {
                     Text("Scroll Wheel Speed")
                         .font(.system(size: 17, weight: .bold, design: .rounded))
                         .foregroundColor(.white)
-                    Text("Active: Level \(state.scrollSpeed) / 10 · HID Acceleration")
+                    Text("Active: Level \(state.scrollSpeed)/10 (\(String(format: "%.2gx", state.currentWheelMultiplier)) Multiplier)")
                         .font(.system(size: 13, weight: .medium, design: .rounded))
                         .foregroundColor(Color(hex: "8E9491"))
                 }
                 Spacer()
+                
+                Button(action: {
+                    state.toggleScrollWheelDirection()
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.arrow.down")
+                            .font(.system(size: 11, weight: .bold))
+                        Text(state.invertScrollWheel ? "Reversed" : "Standard")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                    }
+                    .foregroundColor(activeThemeColor)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(activeThemeColor.opacity(0.15))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(PlainButtonStyle())
+                .focusable(false)
             }
             
             // Quick Scroll Speed Presets

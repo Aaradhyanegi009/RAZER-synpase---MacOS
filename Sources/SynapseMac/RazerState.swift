@@ -15,11 +15,13 @@ class RazerState: ObservableObject {
     @Published var toastText: String = "Saved to Onboard Memory"
     @Published var activeTab: Int = 0 // 0: All/Home, 1: DPI, 2: Polling/Gestures, 3: Lighting
     @Published var invertSwipeButtons: Bool = false
-    @Published var scrollSpeed: Int = 3 // 1 (Slow) to 10 (Fast), 3 = Default (20480)
+    @Published var scrollSpeed: Int = 3 // 1 (Slow) to 10 (Fast), 3 = Default (1.0x)
+    @Published var invertScrollWheel: Bool = false
     
     private var timer: AnyCancellable?
     
     init() {
+        loadKarabinerState()
         refreshFromHardware()
         
         timer = Timer.publish(every: 3.0, on: .main, in: .common)
@@ -105,19 +107,42 @@ class RazerState: ObservableObject {
     
     func toggleSwipeDirection() {
         invertSwipeButtons.toggle()
-        updateKarabinerSwipeDirection(inverted: invertSwipeButtons)
+        syncKarabinerConfig()
         triggerToast(invertSwipeButtons ? "Buttons 4/5 Inverted" : "Buttons 4/5 Standard")
+    }
+    
+    func toggleScrollWheelDirection() {
+        invertScrollWheel.toggle()
+        syncKarabinerConfig()
+        triggerToast(invertScrollWheel ? "Scroll Wheel Reversed" : "Scroll Wheel Standard")
     }
     
     func setScrollSpeed(_ speed: Int) {
         let clamped = max(1, min(10, speed))
+        guard clamped != self.scrollSpeed else { return }
         self.scrollSpeed = clamped
         applyScrollSpeed()
-        triggerToast("Scroll Speed Level \(clamped) Applied")
+        triggerToast("Scroll Speed \(clamped)x Applied")
+    }
+    
+    var currentWheelMultiplier: Double {
+        let multTable: [Int: Double] = [
+            1: 0.5,
+            2: 0.75,
+            3: 1.0,
+            4: 1.35,
+            5: 1.75,
+            6: 2.2,
+            7: 2.7,
+            8: 3.3,
+            9: 4.0,
+            10: 5.0
+        ]
+        return multTable[self.scrollSpeed] ?? 1.0
     }
     
     func applyScrollSpeed() {
-        let table: [Int: Int] = [
+        let accelTable: [Int: Int] = [
             1: 5120,
             2: 12288,
             3: 20480,
@@ -126,16 +151,24 @@ class RazerState: ObservableObject {
             6: 65536,
             7: 98304,
             8: 131072,
-            9: 170393,
-            10: 209715
+            9: 163840,
+            10: 196608
         ]
-        let accel = table[self.scrollSpeed] ?? 20480
+        let accel = accelTable[self.scrollSpeed] ?? 20480
         let scale = Double(accel) / 65536.0
         
+        // 1. Update Karabiner DriverKit hardware wheel multiplier atomically
+        syncKarabinerConfig()
+        
+        // 2. Update macOS HIDMouseScrollAcceleration across all pointing drivers (Karabiner VirtualHIDPointing + Razer)
         DispatchQueue.global(qos: .userInitiated).async {
             let p1 = Process()
             p1.executableURL = URL(fileURLWithPath: "/usr/bin/hidutil")
-            p1.arguments = ["property", "--matching", "{\"VendorID\":5426}", "--set", "{\"HIDScrollAcceleration\":\(accel)}"]
+            p1.arguments = [
+                "property",
+                "--set",
+                "{\"HIDMouseScrollAcceleration\":\(accel),\"HIDScrollAcceleration\":\(accel)}"
+            ]
             try? p1.run()
             p1.waitUntilExit()
             
@@ -185,9 +218,37 @@ class RazerState: ObservableObject {
         }
     }
     
-    private func updateKarabinerSwipeDirection(inverted: Bool) {
-        let btn4Key = inverted ? "right_arrow" : "left_arrow"
-        let btn5Key = inverted ? "left_arrow" : "right_arrow"
+    private func loadKarabinerState() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = "\(home)/.config/karabiner/karabiner.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profiles = json["profiles"] as? [[String: Any]],
+              let first = profiles.first,
+              let devices = first["devices"] as? [[String: Any]] else { return }
+        
+        for dev in devices {
+            if let ids = dev["identifiers"] as? [String: Any],
+               let vid = ids["vendor_id"] as? Int, vid == 5426 {
+                if let flip = dev["mouse_flip_vertical_wheel"] as? Bool {
+                    self.invertScrollWheel = flip
+                }
+                if let mult = dev["pointing_motion_wheels_multiplier"] as? Double {
+                    let multMap: [(Int, Double)] = [
+                        (1, 0.5), (2, 0.75), (3, 1.0), (4, 1.35), (5, 1.75),
+                        (6, 2.2), (7, 2.7), (8, 3.3), (9, 4.0), (10, 5.0)
+                    ]
+                    if let closest = multMap.min(by: { abs($0.1 - mult) < abs($1.1 - mult) }) {
+                        self.scrollSpeed = closest.0
+                    }
+                }
+            }
+        }
+    }
+
+    private func syncKarabinerConfig() {
+        let btn4Key = invertSwipeButtons ? "right_arrow" : "left_arrow"
+        let btn5Key = invertSwipeButtons ? "left_arrow" : "right_arrow"
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let path = "\(home)/.config/karabiner/karabiner.json"
         
@@ -225,10 +286,36 @@ class RazerState: ObservableObject {
             "manipulators": manipulators
         ]]
         profiles[0]["complex_modifications"] = complex
+        
+        // Update Razer DeathAdder Essential device entry with wheel multiplier & flip
+        var devices = (profiles[0]["devices"] as? [[String: Any]]) ?? []
+        var foundRazer = false
+        for i in 0..<devices.count {
+            if let ids = devices[i]["identifiers"] as? [String: Any],
+               let vid = ids["vendor_id"] as? Int, vid == 5426 {
+                devices[i]["pointing_motion_wheels_multiplier"] = currentWheelMultiplier
+                devices[i]["mouse_flip_vertical_wheel"] = invertScrollWheel
+                foundRazer = true
+            }
+        }
+        if !foundRazer {
+            devices.append([
+                "identifiers": [
+                    "is_pointing_device": true,
+                    "product_id": 152,
+                    "vendor_id": 5426
+                ],
+                "ignore": false,
+                "pointing_motion_wheels_multiplier": currentWheelMultiplier,
+                "mouse_flip_vertical_wheel": invertScrollWheel,
+                "simple_modifications": []
+            ])
+        }
+        profiles[0]["devices"] = devices
         json["profiles"] = profiles
         
         if let outData = try? JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys]) {
-            try? outData.write(to: URL(fileURLWithPath: path))
+            try? outData.write(to: URL(fileURLWithPath: path), options: .atomic)
         }
     }
     
